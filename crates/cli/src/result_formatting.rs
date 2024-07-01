@@ -2,15 +2,14 @@ use anyhow::anyhow;
 use colored::Colorize;
 use console::style;
 use core::fmt;
-use log::info;
+use log::{debug, error, info, warn};
 use marzano_core::api::{
-    AllDone, AnalysisLog, CreateFile, DoneFile, FileMatchResult, InputFile, Match, MatchResult,
-    PatternInfo, RemoveFile, Rewrite,
+    AllDone, AnalysisLog, AnalysisLogLevel, CreateFile, DoneFile, FileMatchResult, InputFile,
+    Match, MatchResult, PatternInfo, RemoveFile, Rewrite,
 };
 use marzano_core::constants::DEFAULT_FILE_NAME;
 use marzano_messenger::output_mode::OutputMode;
 use std::fmt::Display;
-use std::fs::read_to_string;
 use std::{
     io::Write,
     sync::{Arc, Mutex},
@@ -168,7 +167,7 @@ impl fmt::Display for FormattedResult {
             FormattedResult::Match(m) => {
                 let path_title = m.file_name().bold();
                 writeln!(f, "{}", path_title)?;
-                let source = read_to_string(m.file_name());
+                let source = m.content();
                 match source {
                     Err(e) => {
                         writeln!(f, "Could not read file: {}", e)?;
@@ -339,6 +338,112 @@ impl Messager for FormattedMessager<'_> {
     }
     fn track_supress(&mut self, _supressed: &MatchResult) -> anyhow::Result<()> {
         self.total_supressed += 1;
+        Ok(())
+    }
+
+    fn emit_log(&mut self, log: &marzano_messenger::SimpleLogMessage) -> anyhow::Result<()> {
+        if let Some(writer) = &mut self.writer {
+            let mut writer = writer.lock().map_err(|_| anyhow!("Output lock poisoned"))?;
+            writeln!(writer, "[{:?}] {}", log.level, log.message)?;
+        } else {
+            match log.level {
+                AnalysisLogLevel::Debug => {
+                    debug!("{}", log.message);
+                }
+                AnalysisLogLevel::Info => {
+                    info!("{}", log.message);
+                }
+                AnalysisLogLevel::Warn => {
+                    warn!("{}", log.message);
+                }
+                AnalysisLogLevel::Error => {
+                    error!("{}", log.message);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Prints the transformed files themselves, with no metadata
+pub struct TransformedMessenger<'a> {
+    writer: Option<Arc<Mutex<Box<dyn Write + Send + 'a>>>>,
+    total_accepted: usize,
+    total_rejected: usize,
+    total_supressed: usize,
+}
+
+impl<'a> TransformedMessenger<'_> {
+    pub fn new(writer: Option<Box<dyn Write + Send + 'a>>) -> TransformedMessenger<'a> {
+        TransformedMessenger {
+            writer: writer.map(|w| Arc::new(Mutex::new(w))),
+            total_accepted: 0,
+            total_rejected: 0,
+            total_supressed: 0,
+        }
+    }
+}
+
+impl Messager for TransformedMessenger<'_> {
+    fn raw_emit(&mut self, message: &MatchResult) -> anyhow::Result<()> {
+        match message {
+            MatchResult::PatternInfo(_)
+            | MatchResult::AllDone(_)
+            | MatchResult::InputFile(_)
+            | MatchResult::DoneFile(_) => {
+                // ignore these
+            }
+            MatchResult::Match(message) => {
+                info!("Matched file {}", message.file_name());
+            }
+            MatchResult::Rewrite(file) => {
+                // Write the file contents to the output
+                if let Some(writer) = &mut self.writer {
+                    let mut writer = writer.lock().map_err(|_| anyhow!("Output lock poisoned"))?;
+                    writeln!(writer, "{}", file.content().unwrap_or_default())?;
+                } else {
+                    info!("{}", file.content().unwrap_or_default());
+                }
+            }
+            MatchResult::CreateFile(file) => {
+                // Write the file contents to the output
+                if let Some(writer) = &mut self.writer {
+                    let mut writer = writer.lock().map_err(|_| anyhow!("Output lock poisoned"))?;
+                    writeln!(writer, "{}", file.content().unwrap_or_default())?;
+                } else {
+                    info!("{}", file.content().unwrap_or_default());
+                }
+            }
+            MatchResult::RemoveFile(file) => {
+                info!("File {} should be removed", file.original.source_file);
+            }
+            MatchResult::AnalysisLog(_) => {
+                // TODO: should this go somewhere else
+                let formatted = FormattedResult::new(message.clone(), false);
+                if let Some(formatted) = formatted {
+                    info!("{}", formatted);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn track_accept(&mut self, _accepted: &MatchResult) -> anyhow::Result<()> {
+        self.total_accepted += 1;
+        Ok(())
+    }
+    fn track_reject(&mut self, _rejected: &MatchResult) -> anyhow::Result<()> {
+        self.total_rejected += 1;
+        Ok(())
+    }
+    fn track_supress(&mut self, _supressed: &MatchResult) -> anyhow::Result<()> {
+        self.total_supressed += 1;
+        Ok(())
+    }
+
+    fn emit_log(&mut self, log: &marzano_messenger::SimpleLogMessage) -> anyhow::Result<()> {
+        log::debug!("Log received over RPC: {:?}", log);
         Ok(())
     }
 }

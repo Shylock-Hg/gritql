@@ -12,8 +12,8 @@ use anyhow::{anyhow, bail, Result};
 use grit_util::{AnalysisLogs, CodeRange, Range, VariableMatch};
 use im::{vector, Vector};
 use rand::SeedableRng;
-use std::collections::HashMap;
 use std::ops::Range as StdRange;
+use std::{collections::HashMap, path::PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct EffectRange<'a, Q: QueryContext> {
@@ -28,38 +28,101 @@ impl<Q: QueryContext> Interval for EffectRange<'_, Q> {
 }
 
 #[derive(Clone, Debug)]
-pub struct FileRegistry<'a, Q: QueryContext>(Vector<Vector<&'a FileOwner<Q::Tree>>>);
+pub struct FileRegistry<'a, Q: QueryContext> {
+    /// The number of versions for each file
+    version_count: Vec<u16>,
+    /// Original file paths, for lazy loading
+    file_paths: Vec<&'a PathBuf>,
+    /// The actual FileOwner, which has the full file available
+    owners: Vector<Vector<&'a FileOwner<Q::Tree<'a>>>>,
+}
 
 impl<'a, Q: QueryContext> FileRegistry<'a, Q> {
-    pub fn get_file(&self, pointer: FilePtr) -> &'a FileOwner<Q::Tree> {
-        self.0[pointer.file as usize][pointer.version as usize]
+    pub fn get_file_owner(&self, pointer: FilePtr) -> &'a FileOwner<Q::Tree<'a>> {
+        self.owners[pointer.file as usize][pointer.version as usize]
     }
 
-    pub fn new(files: Vector<Vector<&'a FileOwner<Q::Tree>>>) -> Self {
-        Self(files)
+    pub fn get_file_name(&self, pointer: FilePtr) -> &'a PathBuf {
+        let file_index = pointer.file as usize;
+        let version_index = pointer.version as usize;
+        if let Some(owners) = self.owners.get(file_index) {
+            if let Some(owner) = owners.get(version_index) {
+                return &owner.name;
+            }
+        }
+        self.file_paths
+            .get(file_index)
+            .expect("File path should exist for given file index.")
     }
 
-    // assumes at least one revision exists
-    pub fn latest_revision(&self, pointer: &FilePtr) -> FilePtr {
-        let latest = self.0[pointer.file as usize].len() - 1;
-        FilePtr {
-            file: pointer.file,
-            version: latest as u16,
+    pub fn get_absolute_path(&self, pointer: FilePtr) -> Result<&'a PathBuf> {
+        let file_index = pointer.file as usize;
+        let version_index = pointer.version as usize;
+        if let Some(owners) = self.owners.get(file_index) {
+            if let Some(owner) = owners.get(version_index) {
+                return Ok(&owner.absolute_path);
+            }
+        }
+        Err(anyhow!(
+            "Absolute file path accessed before file was loaded."
+        ))
+    }
+
+    /// If only the paths are available, create a FileRegistry with empty owners
+    /// This is *unsafe* if you do not later insert the appropriate owners before get_file_owner is called
+    pub fn new_from_paths(file_paths: Vec<&'a PathBuf>) -> Self {
+        Self {
+            version_count: file_paths.iter().map(|_| 0).collect(),
+            owners: file_paths.iter().map(|_| vector![]).collect(),
+            file_paths,
         }
     }
 
-    pub fn files(&self) -> &Vector<Vector<&'a FileOwner<Q::Tree>>> {
-        &self.0
+    /// Confirms a file is already fully loaded
+    pub fn is_loaded(&self, pointer: &FilePtr) -> bool {
+        self.version_count
+            .get(pointer.file as usize)
+            .map_or(false, |&v| v > 0)
     }
 
-    pub fn push_revision(&mut self, pointer: &FilePtr, file: &'a FileOwner<Q::Tree>) {
-        self.0[pointer.file as usize].push_back(file)
+    /// Load a file in
+    pub fn load_file(&mut self, pointer: &FilePtr, file: &'a FileOwner<Q::Tree<'a>>) {
+        self.push_revision(pointer, file)
     }
 
-    pub fn push_new_file(&mut self, file: &'a FileOwner<Q::Tree>) -> FilePtr {
-        self.0.push_back(vector![file]);
+    /// Returns the latest revision of a given filepointer
+    /// If none exists, returns the file pointer itself
+    pub fn latest_revision(&self, pointer: &FilePtr) -> FilePtr {
+        match self.version_count.get(pointer.file as usize) {
+            Some(&version_count) => {
+                if version_count == 0 {
+                    *pointer
+                } else {
+                    FilePtr {
+                        file: pointer.file,
+                        version: version_count - 1,
+                    }
+                }
+            }
+            None => *pointer,
+        }
+    }
+
+    pub fn files(&self) -> &Vector<Vector<&'a FileOwner<Q::Tree<'a>>>> {
+        &self.owners
+    }
+
+    pub fn push_revision(&mut self, pointer: &FilePtr, file: &'a FileOwner<Q::Tree<'a>>) {
+        self.version_count[pointer.file as usize] += 1;
+        self.owners[pointer.file as usize].push_back(file)
+    }
+
+    pub fn push_new_file(&mut self, file: &'a FileOwner<Q::Tree<'a>>) -> FilePtr {
+        self.version_count.push(1);
+        self.file_paths.push(&file.name);
+        self.owners.push_back(vector![file]);
         FilePtr {
-            file: (self.0.len() - 1) as u16,
+            file: (self.owners.len() - 1) as u16,
             version: 0,
         }
     }
@@ -98,11 +161,11 @@ fn get_top_level_effect_ranges<'a, Q: QueryContext>(
         })
         .map(|effect| {
             let binding = &effect.binding;
-            let ts_range = binding
-                .position(language)
-                .ok_or_else(|| anyhow!("binding has no position"))?;
-            let end_byte = ts_range.end_byte;
-            let start_byte = ts_range.start_byte;
+            let byte_range = binding
+                .range(language)
+                .ok_or_else(|| anyhow!("binding has no range"))?;
+            let end_byte = byte_range.end as u32;
+            let start_byte = byte_range.start as u32;
             Ok(EffectRange {
                 range: start_byte..end_byte,
                 effect: effect.clone(),
@@ -151,12 +214,12 @@ impl FilePtr {
 }
 
 impl<'a, Q: QueryContext> State<'a, Q> {
-    pub fn new(bindings: VarRegistry<'a, Q>, files: Vec<&'a FileOwner<Q::Tree>>) -> Self {
+    pub fn new(bindings: VarRegistry<'a, Q>, registry: FileRegistry<'a, Q>) -> Self {
         Self {
             rng: rand::rngs::StdRng::seed_from_u64(32),
             bindings,
             effects: vector![],
-            files: FileRegistry::new(files.into_iter().map(|f| vector![f]).collect()),
+            files: registry,
         }
     }
 
@@ -179,11 +242,7 @@ impl<'a, Q: QueryContext> State<'a, Q> {
             .enumerate()
             .map(|(index, content)| {
                 let mut content = content.clone();
-                let pattern = if index < args.len() {
-                    args[index].as_ref()
-                } else {
-                    None
-                };
+                let pattern = args.get(index).and_then(Option::as_ref);
                 if let Some(Pattern::Variable(v)) = pattern {
                     content.mirrors.push(v)
                 };
@@ -267,4 +326,4 @@ impl<'a, Q: QueryContext> State<'a, Q> {
     }
 }
 
-type VarRegistry<'a, P> = Vector<Vector<Vector<Box<VariableContent<'a, P>>>>>;
+pub type VarRegistry<'a, P> = Vector<Vector<Vector<Box<VariableContent<'a, P>>>>>;

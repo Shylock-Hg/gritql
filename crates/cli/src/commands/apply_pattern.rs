@@ -3,22 +3,26 @@ use clap::Args;
 
 use dialoguer::Confirm;
 
+use marzano_gritmodule::config::{init_config_from_path, init_global_grit_modules};
+use marzano_gritmodule::resolver::get_grit_files_from_known_grit_dir;
+use marzano_util::rich_path::RichFile;
 use tracing::instrument;
 #[cfg(feature = "grit_tracing")]
 use tracing::span;
 #[cfg(feature = "grit_tracing")]
+#[allow(unused_imports)]
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use grit_util::Position;
 use indicatif::MultiProgress;
-use log::debug;
 use marzano_core::api::{AllDone, AllDoneReason, AnalysisLog, MatchResult};
 use marzano_core::pattern_compiler::CompilationResult;
 use marzano_gritmodule::fetcher::KeepFetcherKind;
 use marzano_gritmodule::markdown::get_body_from_md_content;
-use marzano_gritmodule::searcher::find_grit_modules_dir;
-use marzano_gritmodule::utils::is_pattern_name;
-use marzano_language::target_language::{expand_paths, PatternLanguage};
+use marzano_gritmodule::searcher::{find_global_grit_dir, find_grit_modules_dir};
+use marzano_gritmodule::utils::{infer_pattern, is_pattern_name, parse_remote_name};
+use marzano_language::target_language::PatternLanguage;
+use marzano_messenger::emit::FlushableMessenger as _;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
@@ -29,10 +33,10 @@ use tokio::fs;
 
 use crate::commands::filters::extract_filter_ranges;
 
+use crate::flags::GlobalFormatFlags;
 use crate::{
-    analyze::par_apply_pattern, error::GoodError,
-    flags::OutputFormat, messenger_variant::create_emitter, result_formatting::get_human_error,
-    updater::Updater,
+    analyze::par_apply_pattern, error::GoodError, flags::OutputFormat,
+    messenger_variant::create_emitter, result_formatting::get_human_error, updater::Updater,
 };
 
 use marzano_messenger::{
@@ -40,17 +44,53 @@ use marzano_messenger::{
     output_mode::OutputMode,
 };
 
-use crate::resolver::{get_grit_files_from_cwd, GritModuleResolver};
+use crate::resolver::{get_grit_files_from_flags_or_cwd, GritModuleResolver};
 use crate::utils::has_uncommitted_changes;
 
 use super::filters::SharedFilterArgs;
-use super::init::init_config_from_cwd;
 
+/// Apply a pattern to a set of paths on disk which will be rewritten in place
 #[derive(Deserialize)]
-pub struct ApplyInput {
+pub struct ApplyInputDisk {
     pub pattern_body: String,
     pub pattern_libs: BTreeMap<String, String>,
     pub paths: Vec<PathBuf>,
+}
+
+#[derive(Deserialize)]
+pub struct ApplyInputVirtual {
+    pub pattern_body: String,
+    pub pattern_libs: BTreeMap<String, String>,
+    pub files: Vec<RichFile>,
+}
+
+#[derive(Deserialize)]
+pub enum ApplyInput {
+    Disk(ApplyInputDisk),
+    Virtual(ApplyInputVirtual),
+}
+
+impl ApplyInput {
+    pub fn pattern_body(&self) -> &str {
+        match self {
+            ApplyInput::Disk(d) => &d.pattern_body,
+            ApplyInput::Virtual(v) => &v.pattern_body,
+        }
+    }
+
+    pub fn pattern_libs(&self) -> &BTreeMap<String, String> {
+        match self {
+            ApplyInput::Disk(d) => &d.pattern_libs,
+            ApplyInput::Virtual(v) => &v.pattern_libs,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            ApplyInput::Disk(d) => d.paths.is_empty(),
+            ApplyInput::Virtual(v) => v.files.is_empty(),
+        }
+    }
 }
 
 #[derive(Args, Clone, Debug, Serialize)]
@@ -65,9 +105,6 @@ pub struct ApplyPatternArgs {
     // If the pattern already has a limit, this will override it
     #[clap(short = 'm', long = "limit")]
     pub limit: Option<usize>,
-    // TODO: consider removing this
-    #[clap(long = "ignore-limit", default_value = "false", hide = true)]
-    ignore_limit: bool,
     // Dry run
     #[clap(
         long = "dry-run",
@@ -103,6 +140,14 @@ pub struct ApplyPatternArgs {
         help = "Path to a file to write the results to, defaults to stdout"
     )]
     output_file: Option<PathBuf>,
+    /// Use this option when you want to transform code piped from `stdin`, and print the output to `stdout`.
+    ///
+    /// If you use this option, you *must* specify a file path, to allow Grit to determine the language of the code.
+    ///
+    /// Example: `echo 'console.log(hello)' | grit apply '`hello` => `goodbye`' file.js --stdin
+    /// This will print `console.log(goodbye)` to stdout
+    #[clap(long = "stdin")]
+    pub stdin: bool,
     /// Use cache
     #[clap(long = "cache", conflicts_with = "refresh_cache")]
     pub cache: bool,
@@ -122,7 +167,6 @@ impl Default for ApplyPatternArgs {
         Self {
             output: Default::default(),
             limit: Default::default(),
-            ignore_limit: Default::default(),
             dry_run: Default::default(),
             force: Default::default(),
             format: Default::default(),
@@ -133,6 +177,7 @@ impl Default for ApplyPatternArgs {
             refresh_cache: Default::default(),
             ai: Default::default(),
             language: Default::default(),
+            stdin: Default::default(),
         }
     }
 }
@@ -159,8 +204,8 @@ pub(crate) async fn run_apply_pattern(
     multi: MultiProgress,
     details: &mut ApplyDetails,
     pattern_libs: Option<BTreeMap<String, String>>,
-    lang: Option<PatternLanguage>,
-    format: OutputFormat,
+    default_lang: Option<PatternLanguage>,
+    format_flags: &GlobalFormatFlags,
     root_path: Option<PathBuf>,
 ) -> Result<()> {
     let mut context = Updater::from_current_bin()
@@ -169,12 +214,48 @@ pub(crate) async fn run_apply_pattern(
         .get_context()
         .unwrap();
 
-    if arg.ignore_limit {
-        context.ignore_limit_pattern = true;
-    }
+    let format = OutputFormat::from_flags(
+        format_flags,
+        if arg.stdin {
+            OutputFormat::Transformed
+        } else {
+            OutputFormat::Standard
+        },
+    );
+
+    let default_lang = default_lang.or(arg.language);
+
+    let default_lang = if !arg.stdin {
+        default_lang
+    } else if default_lang.is_none() {
+        // Look at the first path and get the language from the extension
+        let first_path = paths.first().ok_or(anyhow::anyhow!(
+            "A path must be provided as the virtual file name for stdin"
+        ))?;
+        let ext = first_path.extension().ok_or(anyhow::anyhow!(
+            "A path must have an extension to determine the language for stdin"
+        ))?;
+        if let Some(ext) = ext.to_str() {
+            PatternLanguage::from_extension(ext)
+        } else {
+            default_lang
+        }
+    } else {
+        default_lang
+    };
 
     let interactive = arg.interactive;
     let min_level = &arg.visibility;
+
+    let mut emitter = create_emitter(
+        &format,
+        arg.output.clone(),
+        arg.output_file.as_ref(),
+        interactive,
+        Some(&pattern),
+        root_path.as_ref(),
+    )
+    .await?;
 
     #[cfg(feature = "ai_querygen")]
     if arg.ai {
@@ -192,43 +273,68 @@ pub(crate) async fn run_apply_pattern(
     // Get the current directory
     let cwd = std::env::current_dir().unwrap();
 
+    #[cfg(feature = "grit_tracing")]
+    let module_resolution = span!(tracing::Level::INFO, "module_resolution",).entered();
+
     // Construct a resolver
-    let resolver = GritModuleResolver::new(cwd.to_str().unwrap());
+    let resolver = GritModuleResolver::new();
+    let current_repo_root = marzano_gritmodule::fetcher::LocalRepo::from_dir(&cwd)
+        .await
+        .map(|repo| repo.root())
+        .transpose()?;
+    #[cfg(feature = "grit_tracing")]
+    module_resolution.exit();
 
-    let mut emitter = create_emitter(
-        &format,
-        arg.output.clone(),
-        arg.output_file.as_ref(),
-        interactive,
-        Some(&pattern),
-        root_path.as_ref(),
-    )
-    .await?;
+    let filter_range = flushable_unwrap!(
+        emitter,
+        extract_filter_ranges(&shared, current_repo_root.as_ref())
+    );
 
-    let filter_range = flushable_unwrap!(emitter, extract_filter_ranges(&shared));
+    #[cfg(feature = "grit_tracing")]
+    let span_libs = span!(tracing::Level::INFO, "prep_libs",).entered();
 
     let (my_input, lang) = if let Some(pattern_libs) = pattern_libs {
         (
-            ApplyInput {
+            ApplyInputDisk {
                 pattern_body: pattern.clone(),
                 paths,
                 pattern_libs,
             },
-            lang,
+            default_lang,
         )
     } else {
-        let mod_dir = find_grit_modules_dir(cwd.clone()).await;
+        #[cfg(feature = "grit_tracing")]
+        let stdlib_download_span = span!(tracing::Level::INFO, "stdlib_download",).entered();
+
+        let target_grit_dir = format_flags
+            .grit_dir
+            .as_ref()
+            .and_then(|c| c.parent())
+            .unwrap_or_else(|| &cwd)
+            .to_path_buf();
+        let mod_dir = find_grit_modules_dir(target_grit_dir.clone()).await;
+        let target_remote = parse_remote_name(&pattern);
+
         if !env::var("GRIT_DOWNLOADS_DISABLED")
             .unwrap_or_else(|_| "false".to_owned())
             .parse::<bool>()
             .unwrap_or(false)
             && mod_dir.is_err()
+            && target_remote.is_none()
         {
             flushable_unwrap!(
                 emitter,
-                init_config_from_cwd::<KeepFetcherKind>(cwd.clone(), false).await
+                init_config_from_path::<KeepFetcherKind>(target_grit_dir, false).await
+            );
+        } else if let Some(target) = &target_remote {
+            flushable_unwrap!(
+                emitter,
+                init_global_grit_modules::<KeepFetcherKind>(Some(target)).await
             );
         }
+
+        #[cfg(feature = "grit_tracing")]
+        stdlib_download_span.exit();
 
         let warn_uncommitted =
             !arg.dry_run && !arg.force && has_uncommitted_changes(cwd.clone()).await;
@@ -248,67 +354,67 @@ pub(crate) async fn run_apply_pattern(
             }
         }
 
-        let pattern_libs = flushable_unwrap!(emitter, get_grit_files_from_cwd().await);
-        let (mut lang, pattern_body) = if pattern.ends_with(".grit") || pattern.ends_with(".md") {
-            match fs::read_to_string(pattern.clone()).await {
-                Ok(pb) => {
-                    if pattern.ends_with(".grit") {
-                        let lang = PatternLanguage::get_language(&pb);
-                        (lang, pb)
-                    } else if pattern.ends_with(".md") {
-                        let body = flushable_unwrap!(emitter, get_body_from_md_content(&pb));
-                        let lang = PatternLanguage::get_language(&body);
-                        (lang, body)
-                    } else {
-                        unreachable!()
-                    }
-                }
-                Err(_) => {
-                    let my_err = anyhow::anyhow!("Could not read pattern file: {}", pattern);
-                    let log = MatchResult::AnalysisLog(AnalysisLog {
-                        level: 100,
-                        message: my_err.to_string(),
-                        position: Position::first(),
-                        file: "PlaygroundPattern".to_string(),
-                        engine_id: "marzano".to_string(),
-                        syntax_tree: None,
-                        range: None,
-                        source: None,
-                    });
-                    emitter.emit(&log, min_level).unwrap();
-                    emitter.flush().await?;
-                    if format.is_always_ok().0 {
-                        return Ok(());
-                    } else {
-                        return Err(my_err);
-                    }
-                }
-            }
+        #[cfg(feature = "grit_tracing")]
+        let grit_file_discovery = span!(tracing::Level::INFO, "grit_file_discovery",).entered();
+
+        let pattern_libs = if let Some(target) = target_remote {
+            let global = find_global_grit_dir().await?;
+            flushable_unwrap!(
+                emitter,
+                get_grit_files_from_known_grit_dir(&global, vec![target]).await
+            )
         } else {
-            match is_pattern_name(&pattern) {
-                true => {
-                    let raw_name = pattern.trim_end_matches("()");
-                    details.named_pattern = Some(raw_name.to_string());
-                    let presumptive_grit_file =
-                        pattern_libs.get(format!("{}.grit", raw_name).as_str());
-                    let lang = match presumptive_grit_file {
-                        Some(g) => PatternLanguage::get_language(g),
-                        None => PatternLanguage::get_language(&pattern),
-                    };
-                    let body = if pattern.ends_with(')') {
-                        pattern.clone()
-                    } else {
-                        format!("{}()", pattern)
-                    };
-                    (lang, body)
-                }
-                false => {
-                    let lang = PatternLanguage::get_language(&pattern);
-                    (lang, pattern.clone())
-                }
-            }
+            flushable_unwrap!(
+                emitter,
+                get_grit_files_from_flags_or_cwd(format_flags).await
+            )
         };
-        if let Some(lang_option) = &arg.language {
+
+        let (mut lang, named_pattern, pattern_body) =
+            if pattern.ends_with(".grit") || pattern.ends_with(".md") {
+                match fs::read_to_string(pattern.clone()).await {
+                    Ok(pb) => {
+                        if pattern.ends_with(".grit") {
+                            let lang = PatternLanguage::get_language(&pb);
+                            (lang, None, pb)
+                        } else if pattern.ends_with(".md") {
+                            let body = flushable_unwrap!(emitter, get_body_from_md_content(&pb));
+                            let lang = PatternLanguage::get_language(&body);
+                            (lang, None, body)
+                        } else {
+                            unreachable!()
+                        }
+                    }
+                    Err(_) => {
+                        let my_err = anyhow::anyhow!("Could not read pattern file: {}", pattern);
+                        let log = MatchResult::AnalysisLog(AnalysisLog {
+                            level: 100,
+                            message: my_err.to_string(),
+                            position: Position::first(),
+                            file: "PlaygroundPattern".to_string(),
+                            engine_id: "marzano".to_string(),
+                            syntax_tree: None,
+                            range: None,
+                            source: None,
+                        });
+                        emitter.emit(&log, min_level).unwrap();
+                        emitter.flush().await?;
+                        if format.is_always_ok().0 {
+                            return Ok(());
+                        } else {
+                            return Err(my_err);
+                        }
+                    }
+                }
+            } else {
+                infer_pattern(&pattern, &pattern_libs)
+            };
+
+        if let Some(named_pattern) = named_pattern {
+            details.named_pattern = Some(named_pattern.to_string());
+        }
+
+        if let Some(lang_option) = &default_lang {
             if let Some(lang) = lang {
                 if lang != *lang_option {
                     return Err(anyhow::anyhow!(
@@ -324,8 +430,11 @@ pub(crate) async fn run_apply_pattern(
             emitter,
             pattern_libs.get_language_directory_or_default(lang)
         );
+        #[cfg(feature = "grit_tracing")]
+        grit_file_discovery.exit();
+
         (
-            ApplyInput {
+            ApplyInputDisk {
                 pattern_body,
                 pattern_libs,
                 paths: paths.to_owned(),
@@ -334,7 +443,38 @@ pub(crate) async fn run_apply_pattern(
         )
     };
 
-    if my_input.paths.is_empty() {
+    let final_input = if arg.stdin {
+        let mut content = String::new();
+        use std::io::Read;
+        std::io::stdin().read_to_string(&mut content)?;
+
+        let ApplyInputDisk {
+            pattern_body,
+            pattern_libs,
+            paths,
+        } = my_input;
+
+        if paths.len() != 1 {
+            bail!("Only one path can be provided as the virtual file name for --stdin");
+        }
+
+        let first_path = paths.first().ok_or(anyhow::anyhow!(
+            "A path must be provided as the virtual file name for stdin"
+        ))?;
+
+        ApplyInput::Virtual(ApplyInputVirtual {
+            pattern_body,
+            pattern_libs,
+            files: vec![RichFile {
+                path: first_path.to_string_lossy().into(),
+                content,
+            }],
+        })
+    } else {
+        ApplyInput::Disk(my_input)
+    };
+
+    if final_input.is_empty() {
         let all_done = MatchResult::AllDone(AllDone {
             processed: 0,
             found: 0,
@@ -346,24 +486,32 @@ pub(crate) async fn run_apply_pattern(
         return Ok(());
     }
 
+    #[cfg(feature = "grit_tracing")]
+    let collect_name = span!(tracing::Level::INFO, "collect_name",).entered();
     let current_name = if is_pattern_name(&pattern) {
         Some(pattern.trim_end_matches("()").to_string())
     } else {
-        my_input
-            .pattern_libs
+        final_input
+            .pattern_libs()
             .iter()
             .find(|(_, body)| body.trim() == pattern.trim())
             .map(|(name, _)| name.clone())
     };
+    #[cfg(feature = "grit_tracing")]
+    collect_name.exit();
+
     let pattern: crate::resolver::RichPattern<'_> = flushable_unwrap!(
         emitter,
-        resolver.make_pattern(&my_input.pattern_body, current_name)
+        resolver.make_pattern(final_input.pattern_body(), current_name)
     );
+
+    #[cfg(feature = "grit_tracing")]
+    span_libs.exit();
 
     let CompilationResult {
         problem: compiled,
         compilation_warnings,
-    } = match pattern.compile(&my_input.pattern_libs, lang, filter_range, arg.limit) {
+    } = match pattern.compile(final_input.pattern_libs(), lang, filter_range, arg.limit) {
         Ok(c) => c,
         Err(e) => {
             let log = match e.downcast::<grit_util::AnalysisLog>() {
@@ -388,7 +536,7 @@ pub(crate) async fn run_apply_pattern(
                 (false, false) => bail!(GoodError::new()),
                 (false, true) => bail!(GoodError::new_with_message(get_human_error(
                     log,
-                    &my_input.pattern_body
+                    final_input.pattern_body(),
                 ))),
             }
         }
@@ -399,23 +547,12 @@ pub(crate) async fn run_apply_pattern(
             .unwrap();
     }
 
-    debug!(
-        "Applying pattern: {:?}, {:?}",
-        my_input.paths, compiled.language
-    );
-
-    let file_walker = flushable_unwrap!(
-        emitter,
-        expand_paths(&my_input.paths, Some(&[(&compiled.language).into()]))
-    );
-
     let processed = AtomicI32::new(0);
 
     let mut emitter = par_apply_pattern(
-        file_walker,
         multi,
         compiled,
-        &my_input,
+        final_input,
         emitter,
         &processed,
         details,

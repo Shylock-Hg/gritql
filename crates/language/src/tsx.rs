@@ -1,14 +1,14 @@
 use crate::{
     js_like::{
         js_like_disregarded_field_values, js_like_get_statement_sorts, js_like_is_comment,
-        jslike_check_replacements, MarzanoJsLikeParser,
+        js_like_is_metavariable, jslike_check_replacements, MarzanoJsLikeParser,
     },
     language::{
         check_disregarded_field_map, fields_for_nodes, kind_and_field_id_for_field_map, Field,
         FieldExpectation, MarzanoLanguage, NodeTypes, SortId, TSLanguage, Tree,
     },
 };
-use grit_util::{AstNode, Language, Parser, Range, Replacement};
+use grit_util::{AstNode, ByteRange, Language, Parser, Replacement};
 use marzano_util::node_with_source::NodeWithSource;
 use std::sync::OnceLock;
 
@@ -76,14 +76,10 @@ impl NodeTypes for Tsx {
 }
 
 impl Language for Tsx {
-    type Node<'a> = NodeWithSource<'a>;
+    use_marzano_js_like_delegate!();
 
     fn language_name(&self) -> &'static str {
         "TSX"
-    }
-
-    fn alternate_metavariable_kinds(&self) -> &[&'static str] {
-        &["template_content", "template_literal_type_content"]
     }
 
     fn snippet_context_strings(&self) -> &[(&'static str, &'static str)] {
@@ -109,12 +105,12 @@ impl Language for Tsx {
         ]
     }
 
-    fn is_comment(&self, node: &NodeWithSource) -> bool {
-        MarzanoLanguage::is_comment_node(self, node)
-    }
-
     fn is_metavariable(&self, node: &NodeWithSource) -> bool {
-        MarzanoLanguage::is_metavariable_node(self, node)
+        js_like_is_metavariable(
+            node,
+            self,
+            &["template_content", "template_literal_type_content"],
+        )
     }
 
     fn is_statement(&self, node: &NodeWithSource) -> bool {
@@ -122,21 +118,17 @@ impl Language for Tsx {
     }
 
     // assumes trim doesn't do anything otherwise range is off
-    fn comment_text_range(&self, node: &NodeWithSource) -> Option<Range> {
+    fn comment_text_range(&self, node: &NodeWithSource) -> Option<ByteRange> {
         let content_text = node.text().ok()?;
         let content_text = content_text.trim();
         let mut range = node.range();
         if content_text.starts_with("//") {
-            range.adjust_columns(2, 0).then_some(range)
+            range.adjust_columns(2, 0).then(|| range.into())
         } else if content_text.starts_with("/*") && content_text.ends_with("*/") {
-            range.adjust_columns(2, -2).then_some(range)
+            range.adjust_columns(2, -2).then(|| range.into())
         } else {
             None
         }
-    }
-
-    fn check_replacements(&self, n: NodeWithSource<'_>, orphan_ranges: &mut Vec<Replacement>) {
-        jslike_check_replacements(n, orphan_ranges)
     }
 }
 

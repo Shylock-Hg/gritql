@@ -1,11 +1,12 @@
 use crate::{
-    config::{DefinitionSource, GritUserConfig},
+    config::{get_stdlib_modules, DefinitionSource, GritUserConfig},
     fetcher::GritModuleFetcher,
+    searcher::find_grit_dir_from,
 };
 use std::{
     collections::{HashMap, HashSet},
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
 };
 
@@ -92,9 +93,10 @@ pub async fn find_user_patterns() -> Result<Vec<ResolvedGritDefinition>> {
 pub async fn fetch_modules<T: FetcherType>(
     module: &ModuleRepo,
     grit_parent_dir: &str,
+    override_grit_dir: Option<PathBuf>,
 ) -> Result<()> {
     let as_path = PathBuf::from_str(grit_parent_dir).unwrap();
-    let grit_dir = as_path.join(REPO_CONFIG_DIR_NAME);
+    let grit_dir = override_grit_dir.unwrap_or_else(|| as_path.join(REPO_CONFIG_DIR_NAME));
 
     // Since git cloning is slow, two processes can try to clone at the same time and cause issues because they are overwriting each other
     // To avoid this, we create a random dir name and move it to the actual gritmodules dir after cloning is complete
@@ -715,6 +717,48 @@ fn merge_local_with_remote(
         language: remote.language,
         kind: remote.kind,
         visibility: local.visibility,
+    }
+}
+
+pub async fn get_grit_files_from_known_grit_dir(
+    config_path: &Path,
+    must_process: Vec<ModuleRepo>,
+) -> Result<PatternsDirectory> {
+    let mut stdlib_modules = get_stdlib_modules();
+    stdlib_modules.extend(must_process);
+
+    let grit_parent = PathBuf::from(config_path.parent().context(format!(
+        "Unable to find parent of .grit directory at {}",
+        config_path.to_string_lossy()
+    ))?);
+    let parent_str = &grit_parent.to_string_lossy().to_string();
+    let repo = ModuleRepo::from_dir(config_path).await;
+    get_grit_files(&repo, parent_str, Some(stdlib_modules)).await
+}
+
+/// This is the primary entrypoint for finding and resolving the right grit files for a given directory
+/// It handles traversing upwards to find the .grit directory, initializing it, and parsing the .grit files
+pub async fn find_and_resolve_grit_dir(
+    cwd: Option<PathBuf>,
+    global_dir: Option<PathBuf>,
+) -> Result<PatternsDirectory> {
+    let existing_config = if let Some(cwd) = cwd {
+        find_grit_dir_from(cwd).await
+    } else {
+        None
+    };
+
+    match existing_config {
+        Some(config) => get_grit_files_from_known_grit_dir(&PathBuf::from(config), vec![]).await,
+        None => match global_dir {
+            Some(global_dir) => {
+                let stdlib_modules = get_stdlib_modules();
+
+                let repo = ModuleRepo::from_dir(&global_dir).await;
+                get_grit_files(&repo, &global_dir.to_string_lossy(), Some(stdlib_modules)).await
+            }
+            None => Ok(PatternsDirectory::new()),
+        },
     }
 }
 

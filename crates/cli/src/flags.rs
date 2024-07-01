@@ -17,11 +17,16 @@ pub struct GlobalFormatFlags {
     /// Override the default log level (info)
     #[arg(long, global = true)]
     pub log_level: Option<log::LevelFilter>,
+    /// Override the default .grit directory location
+    #[arg(long, global = true)]
+    pub grit_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum OutputFormat {
     Standard,
+    /// Print every transformed file back out in full, with no other output
+    Transformed,
     Json,
     Jsonl,
     #[cfg(feature = "remote_redis")]
@@ -33,24 +38,9 @@ pub enum OutputFormat {
 }
 
 impl OutputFormat {
-    /// Should the command always succeed, and should we show an error message?
-    /// Returns (always_succeed, show_error)
-    pub fn is_always_ok(&self) -> (bool, bool) {
-        match self {
-            OutputFormat::Standard => (false, false),
-            OutputFormat::Json | OutputFormat::Jsonl => (true, true),
-            #[cfg(feature = "remote_redis")]
-            OutputFormat::Redis => (false, true),
-            #[cfg(feature = "remote_pubsub")]
-            OutputFormat::PubSub => (false, true),
-            #[cfg(feature = "server")]
-            OutputFormat::Combined => (false, true),
-        }
-    }
-}
-
-impl From<&GlobalFormatFlags> for OutputFormat {
-    fn from(flags: &GlobalFormatFlags) -> Self {
+    /// Gets the OutputFormat from the GlobalFormatFlags
+    /// A default should be provided based on other CLI flags
+    pub fn from_flags(flags: &GlobalFormatFlags, default: OutputFormat) -> Self {
         #[cfg(feature = "server")]
         if flags.pubsub && flags.redis {
             return OutputFormat::Combined;
@@ -68,8 +58,32 @@ impl From<&GlobalFormatFlags> for OutputFormat {
         } else if flags.jsonl {
             OutputFormat::Jsonl
         } else {
-            OutputFormat::Standard
+            default
         }
+    }
+}
+
+impl OutputFormat {
+    /// Should the command always succeed, and should we show an error message?
+    /// Returns (always_succeed, show_error)
+    pub fn is_always_ok(&self) -> (bool, bool) {
+        match self {
+            OutputFormat::Standard => (false, false),
+            OutputFormat::Transformed => (false, false),
+            OutputFormat::Json | OutputFormat::Jsonl => (true, true),
+            #[cfg(feature = "remote_redis")]
+            OutputFormat::Redis => (false, true),
+            #[cfg(feature = "remote_pubsub")]
+            OutputFormat::PubSub => (false, true),
+            #[cfg(feature = "server")]
+            OutputFormat::Combined => (false, true),
+        }
+    }
+}
+
+impl From<&GlobalFormatFlags> for OutputFormat {
+    fn from(flags: &GlobalFormatFlags) -> Self {
+        OutputFormat::from_flags(flags, OutputFormat::Standard)
     }
 }
 

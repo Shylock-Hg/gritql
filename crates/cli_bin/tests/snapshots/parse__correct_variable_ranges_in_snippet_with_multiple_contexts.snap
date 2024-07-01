@@ -1,5 +1,5 @@
 ---
-source: apps/marzano/cli/tests/parse.rs
+source: crates/cli_bin/tests/parse.rs
 expression: "parsed_lines[0]"
 ---
 __typename: PatternInfo
@@ -18,7 +18,7 @@ variables:
     scopedName: 0_3_$absolute_filename
     ranges: []
   - name: $body
-    scopedName: 11_0_$body
+    scopedName: 12_0_$body
     ranges:
       - start:
           line: 1
@@ -29,9 +29,8 @@ variables:
         startByte: 15
         endByte: 20
   - name: $match
-    scopedName: 11_1_$match
+    scopedName: 12_1_$match
     ranges: []
 sourceFile: "`function () { $body }`"
 parsedPattern: "[..]"
 valid: true
-

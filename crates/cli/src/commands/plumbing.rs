@@ -1,7 +1,9 @@
 use anyhow::{anyhow, bail, Result};
 use clap::{Args, Subcommand};
 use indicatif::MultiProgress;
-use marzano_gritmodule::config::GritPatternTestInfo;
+use marzano_gritmodule::config::{
+    init_config_from_path, init_global_grit_modules, GritPatternTestInfo,
+};
 use marzano_gritmodule::fetcher::KeepFetcherKind;
 use marzano_gritmodule::patterns_directory::PatternsDirectory;
 use marzano_gritmodule::searcher::find_grit_modules_dir;
@@ -21,7 +23,6 @@ use super::super::analytics::AnalyticsArgs;
 use super::apply_pattern::{run_apply_pattern, ApplyPatternArgs};
 use super::check::{run_check, CheckArg};
 use super::filters::SharedFilterArgs;
-use super::init::{init_config_from_cwd, init_global_grit_modules};
 use super::list::ListArgs;
 use super::parse::{run_parse, ParseInput};
 use super::patterns::PatternsTestArgs;
@@ -95,7 +96,7 @@ pub enum PlumbingArgs {
 
 fn read_input(shared_args: &SharedPlumbingArgs) -> Result<String> {
     let buffer = if let Some(input) = &shared_args.input {
-        std::fs::read_to_string(input)?
+        fs_err::read_to_string(input)?
     } else {
         let mut buffer = String::new();
         stdin().read_to_string(&mut buffer)?;
@@ -135,7 +136,7 @@ pub(crate) async fn run_plumbing(
                 PatternsDirectory::new()
             } else {
                 let path = PathBuf::from(input.paths.first().unwrap());
-                init_config_from_cwd::<KeepFetcherKind>(path.clone(), false).await?;
+                init_config_from_path::<KeepFetcherKind>(path.clone(), false).await?;
                 get_grit_files_from(Some(path)).await?
             };
             let raw_name = input.pattern_body.trim_end_matches("()");
@@ -155,7 +156,7 @@ pub(crate) async fn run_plumbing(
                 details,
                 Some(pattern_libs.library()),
                 Some(pattern_libs.language()),
-                parent.into(),
+                &parent,
                 input.root_path.map(|p| ensure_trailing_slash(&p)),
             )
             .await
@@ -202,7 +203,7 @@ pub(crate) async fn run_plumbing(
             if input.paths.is_empty() {
                 return Ok(());
             }
-            init_global_grit_modules::<KeepFetcherKind>().await?;
+            init_global_grit_modules::<KeepFetcherKind>(None).await?;
             let combined_args = CheckArg {
                 paths: input.paths,
                 ..args

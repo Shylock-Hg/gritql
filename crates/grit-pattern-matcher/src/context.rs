@@ -20,7 +20,7 @@ pub trait QueryContext: Clone + std::fmt::Debug + Sized + 'static {
     type ResolvedPattern<'a>: ResolvedPattern<'a, Self>;
     type Language<'a>: Language<Node<'a> = Self::Node<'a>>;
     type File<'a>: File<'a, Self>;
-    type Tree: Ast + Clone;
+    type Tree<'a>: Ast<Node<'a> = Self::Node<'a>> + Clone;
 }
 
 /// Contains context necessary for query execution.
@@ -41,8 +41,19 @@ pub trait ExecContext<'a, Q: QueryContext> {
         logs: &mut AnalysisLogs,
     ) -> Result<Q::ResolvedPattern<'a>>;
 
+    /// Call this when "entering" a file to lazily load it.
+    /// This MUST be implemented correctly, or the query engine will not work.
+    ///
+    // TODO: ideally this should be async, but that requires engine-wide async support.
+    fn load_file(
+        &self,
+        file: &Q::File<'a>,
+        state: &mut State<'a, Q>,
+        logs: &mut AnalysisLogs,
+    ) -> Result<bool>;
+
     // FIXME: Don't depend on Grit's file handling in Context.
-    fn files(&self) -> &FileOwners<Q::Tree>;
+    fn files(&self) -> &FileOwners<Q::Tree<'a>>;
 
     fn language(&self) -> &Q::Language<'a>;
 

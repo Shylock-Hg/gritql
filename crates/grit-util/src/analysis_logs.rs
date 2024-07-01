@@ -32,6 +32,27 @@ pub struct AnalysisLog {
 pub struct AnalysisLogs(Vec<AnalysisLog>);
 
 impl AnalysisLogs {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn add_warning(&mut self, file: Option<PathBuf>, message: impl Into<String>) {
+        self.0.push(AnalysisLog {
+            level: Some(339),
+            file,
+            message: message.into(),
+            ..AnalysisLog::default()
+        });
+    }
+}
+
+impl Default for AnalysisLogs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AnalysisLogs {
     pub fn logs(self) -> Vec<AnalysisLog> {
         self.0
     }

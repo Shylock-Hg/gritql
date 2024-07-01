@@ -1,4 +1,4 @@
-use crate::{AstCursor, CodeRange, Range};
+use crate::{AstCursor, ByteRange, CodeRange};
 use std::{borrow::Cow, str::Utf8Error};
 
 /// Represents an AST node and offers convenient AST-specific functionality.
@@ -36,15 +36,11 @@ pub trait AstNode: std::fmt::Debug + Sized {
     /// Returns the text representation of the node.
     fn text(&self) -> Result<Cow<str>, Utf8Error>;
 
-    /// Returns the range of the node.
-    fn range(&self) -> Range;
+    /// Returns the byte range of the node.
+    fn byte_range(&self) -> ByteRange;
 
     /// Returns the code range of the node.
     fn code_range(&self) -> CodeRange;
-
-    /// Returns the full source code of the parse tree to which the node
-    /// belongs.
-    fn full_source(&self) -> &str;
 
     /// Returns a cursor for traversing the tree, starting at the current node.
     fn walk(&self) -> impl AstCursor<Node = Self>;

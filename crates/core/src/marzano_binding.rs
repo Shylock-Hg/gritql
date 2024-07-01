@@ -1,17 +1,20 @@
-use crate::equivalence::are_equivalent;
 use crate::inline_snippets::inline_sorted_snippets_with_offset;
 use crate::problem::MarzanoQueryContext;
 use crate::smart_insert::calculate_padding;
 use crate::suppress::is_suppress_comment;
+use crate::{equivalence::are_equivalent, inline_snippets::ReplacementInfo};
 use anyhow::{anyhow, Result};
 use grit_pattern_matcher::{
     binding::Binding,
     constant::Constant,
     context::QueryContext,
-    effects::{Effect, EffectKind},
+    effects::Effect,
     pattern::{get_top_level_effects, FileRegistry, ResolvedPattern},
 };
-use grit_util::{AnalysisLogBuilder, AnalysisLogs, AstNode, CodeRange, Language, Position, Range};
+use grit_util::{
+    AnalysisLogBuilder, AnalysisLogs, AstNode, ByteRange, CodeRange, EffectKind, EffectRange,
+    Language, Position, Range,
+};
 use itertools::{EitherOrBoth, Itertools};
 use marzano_language::language::{FieldId, MarzanoLanguage};
 use marzano_language::target_language::TargetLanguage;
@@ -25,7 +28,7 @@ use std::{borrow::Cow, collections::HashMap};
 pub enum MarzanoBinding<'a> {
     // used by slices that don't correspond to a node
     // currently only comment content.
-    String(&'a str, Range),
+    String(&'a str, ByteRange),
     FileName(&'a Path),
     Node(NodeWithSource<'a>),
     // tree-sitter lists ("multiple" fields of nodes) do not have a unique identity
@@ -41,8 +44,7 @@ impl PartialEq for MarzanoBinding<'_> {
             (Self::Empty(_, _), Self::Empty(_, _)) => true,
             (Self::Node(n1), Self::Node(n2)) => n1.text() == n2.text(),
             (Self::String(src1, r1), Self::String(src2, r2)) => {
-                src1[r1.start_byte as usize..r1.end_byte as usize]
-                    == src2[r2.start_byte as usize..r2.end_byte as usize]
+                src1[r1.start..r1.end] == src2[r2.start..r2.end]
             }
             (Self::List(n1, f1), Self::List(n2, f2)) => n1 == n2 && f1 == f2,
             (Self::ConstantRef(c1), Self::ConstantRef(c2)) => c1 == c2,
@@ -51,141 +53,17 @@ impl PartialEq for MarzanoBinding<'_> {
     }
 }
 
-pub(crate) fn pad_snippet(padding: &str, snippet: &str, lang: &impl Language) -> Result<String> {
-    let mut lines = snippet.split('\n');
-    let mut result = lines.next().unwrap_or_default().to_string();
-
-    // Add the rest of lines in the snippet with padding
-    let skip_ranges = lang.get_skip_padding_ranges_for_snippet(snippet);
-    for line in lines {
-        let index = get_slice_byte_offset(snippet, line);
-        if !is_index_in_ranges(index, &skip_ranges) {
-            result.push_str(&format!("\n{}{}", &padding, line))
-        } else {
-            result.push_str(&format!("\n{}", line))
-        }
-    }
-    Ok(result)
-}
-
-fn adjust_ranges(substitutions: &mut [(EffectRange, String)], index: usize, delta: isize) {
-    for (EffectRange { range, .. }, _) in substitutions.iter_mut() {
-        if range.start >= index {
-            range.start = (range.start as isize + delta) as usize;
-        }
-        if range.end >= index {
-            range.end = (range.end as isize + delta) as usize;
-        }
-    }
-}
-
-pub(crate) fn is_index_in_ranges(index: u32, skip_ranges: &[CodeRange]) -> bool {
-    skip_ranges
-        .iter()
-        .any(|r| r.start <= index && index < r.end)
-}
-
-// safety ensure that sup and sub are slices of the same string.
-fn get_slice_byte_offset(sup: &str, sub: &str) -> u32 {
-    unsafe { sub.as_ptr().byte_offset_from(sup.as_ptr()) }.unsigned_abs() as u32
-}
-
-// in multiline snippets, remove padding from every line equal to the padding of the first line,
-// such that the first line is left-aligned.
-fn adjust_padding<'a>(
-    src: &'a str,
-    range: &CodeRange,
-    skip_ranges: &[CodeRange],
-    new_padding: Option<usize>,
-    offset: usize,
-    substitutions: &mut [(EffectRange, String)],
-    lang: &impl Language,
-) -> Result<Cow<'a, str>> {
-    if let Some(new_padding) = new_padding {
-        let newline_index = src[0..range.start as usize].rfind('\n');
-        let pad_strip_amount = if let Some(index) = newline_index {
-            src[index..range.start as usize]
-                .chars()
-                .take_while(|c| c.is_whitespace())
-                .count()
-                - 1
-        } else {
-            0
-        };
-        let mut result = String::new();
-        let snippet = &src[range.start as usize..range.end as usize];
-        let mut lines = snippet.split('\n');
-        // assumes codebase uses spaces for indentation
-        let delta: isize = (new_padding as isize) - (pad_strip_amount as isize);
-        let padding = " ".repeat(pad_strip_amount);
-        let new_padding = " ".repeat(new_padding);
-        result.push_str(lines.next().unwrap_or_default());
-        for line in lines {
-            result.push('\n');
-            let index = get_slice_byte_offset(src, line);
-            if !is_index_in_ranges(index, skip_ranges) {
-                if line.trim().is_empty() {
-                    adjust_ranges(substitutions, offset + result.len(), -(line.len() as isize));
-                    continue;
-                }
-                adjust_ranges(substitutions, offset + result.len(), delta);
-                let line = line.strip_prefix(&padding).ok_or_else(|| {
-                anyhow!(
-                    "expected line \n{}\n to start with {} spaces, code is either not indented with spaces, or does not consistently indent code blocks",
-                    line,
-                    pad_strip_amount
-                )
-            })?;
-                result.push_str(&new_padding);
-                result.push_str(line);
-            } else {
-                result.push_str(line)
-            }
-        }
-        for (_, snippet) in substitutions.iter_mut() {
-            *snippet = pad_snippet(&new_padding, snippet, lang)?;
-        }
-        Ok(result.into())
-    } else {
-        Ok(src[range.start as usize..range.end as usize].into())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct EffectRange {
-    pub(crate) kind: EffectKind,
-    pub(crate) range: StdRange<usize>,
-}
-
-impl EffectRange {
-    pub(crate) fn new(kind: EffectKind, range: StdRange<usize>) -> Self {
-        Self { kind, range }
-    }
-
-    pub(crate) fn start(&self) -> usize {
-        self.range.start
-    }
-
-    // The range which is actually edited by this effect
-    pub(crate) fn effective_range(&self) -> StdRange<usize> {
-        match self.kind {
-            EffectKind::Rewrite => self.range.clone(),
-            EffectKind::Insert => self.range.end..self.range.end,
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn linearize_binding<'a, Q: QueryContext>(
     language: &Q::Language<'a>,
     effects: &[Effect<'a, Q>],
     files: &FileRegistry<'a, Q>,
     memo: &mut HashMap<CodeRange, Option<String>>,
-    source: Q::Node<'a>,
+    source: &Q::Node<'a>,
     range: CodeRange,
     distributed_indent: Option<usize>,
     logs: &mut AnalysisLogs,
-) -> Result<(Cow<'a, str>, Vec<StdRange<usize>>)> {
+) -> Result<(Cow<'a, str>, Vec<StdRange<usize>>, Vec<ReplacementInfo>)> {
     let effects1 = get_top_level_effects(effects, memo, &range, language, logs)?;
 
     let effects1 = effects1
@@ -193,32 +71,29 @@ pub(crate) fn linearize_binding<'a, Q: QueryContext>(
         .map(|effect| {
             let binding = effect.binding;
             let binding_range = Binding::code_range(&binding, language);
-            if let (Some(src), Some(range)) = (binding.source(), binding_range.as_ref()) {
+            if let Some(range) = binding_range.as_ref() {
                 match effect.kind {
                     EffectKind::Rewrite => {
                         if let Some(o) = memo.get(range) {
-                            if let Some(s) = o {
-                                return Ok((binding, s.to_owned().into(), effect.kind));
+                            let aligned_snippet = if let Some(s) = o {
+                                s.clone().into()
                             } else {
                                 let skip_padding_ranges = binding
                                     .as_node()
                                     .map(|n| language.get_skip_padding_ranges(&n))
                                     .unwrap_or_default();
 
-                                return Ok((
-                                    binding,
-                                    adjust_padding(
-                                        src,
-                                        range,
-                                        &skip_padding_ranges,
-                                        distributed_indent,
-                                        0,
-                                        &mut [],
-                                        language,
-                                    )?,
-                                    effect.kind,
-                                ));
-                            }
+                                language.align_padding(
+                                    source,
+                                    range,
+                                    &skip_padding_ranges,
+                                    distributed_indent,
+                                    0,
+                                    &mut [],
+                                )
+                            };
+
+                            return Ok((binding, aligned_snippet, effect.kind));
                         } else {
                             memo.insert(range.clone(), None);
                         }
@@ -249,39 +124,32 @@ pub(crate) fn linearize_binding<'a, Q: QueryContext>(
         .iter()
         .map(|(b, s, k)| {
             let range = b
-                .position(language)
+                .range(language)
                 .ok_or_else(|| anyhow!("binding has no position"))?;
             match k {
                 EffectKind::Insert => Ok((
-                    EffectRange::new(
-                        EffectKind::Insert,
-                        range.start_byte as usize..range.end_byte as usize,
-                    ),
+                    EffectRange::new(EffectKind::Insert, range.start..range.end),
                     s.to_string(),
                 )),
                 EffectKind::Rewrite => Ok((
-                    EffectRange::new(
-                        EffectKind::Rewrite,
-                        range.start_byte as usize..range.end_byte as usize,
-                    ),
+                    EffectRange::new(EffectKind::Rewrite, range.start..range.end),
                     s.to_string(),
                 )),
             }
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let skip_padding_ranges = language.get_skip_padding_ranges(&source);
+    let skip_padding_ranges = language.get_skip_padding_ranges(source);
     // we need to update the ranges of the replacements to account for padding discrepency
-    let adjusted_source = adjust_padding(
-        source.full_source(),
+    let adjusted_source = language.align_padding(
+        source,
         &range,
         &skip_padding_ranges,
         distributed_indent,
         range.start as usize,
         &mut replacements,
-        language,
-    )?;
-    let (res, offset) = inline_sorted_snippets_with_offset(
+    );
+    let (res, offset, mapping) = inline_sorted_snippets_with_offset(
         language,
         adjusted_source.to_string(),
         range.start as usize,
@@ -289,7 +157,8 @@ pub(crate) fn linearize_binding<'a, Q: QueryContext>(
         distributed_indent.is_some(),
     )?;
     memo.insert(range, Some(res.clone()));
-    Ok((res.into(), offset))
+
+    Ok((res.into(), offset, mapping))
 }
 
 impl<'a> Binding<'a, MarzanoQueryContext> for MarzanoBinding<'a> {
@@ -305,7 +174,7 @@ impl<'a> Binding<'a, MarzanoQueryContext> for MarzanoBinding<'a> {
         Self::FileName(path)
     }
 
-    fn from_range(range: Range, source: &'a str) -> Self {
+    fn from_range(range: ByteRange, source: &'a str) -> Self {
         Self::String(source, range)
     }
 
@@ -350,7 +219,7 @@ impl<'a> Binding<'a, MarzanoQueryContext> for MarzanoBinding<'a> {
         match self {
             Self::Empty(_, _) => None,
             Self::Node(node) => Some(node.range()),
-            Self::String(_, range) => Some(range.to_owned()),
+            Self::String(source, range) => Some(Range::from_byte_range(source, range)),
             Self::List(parent_node, field_id) => {
                 get_range_nodes_for_list(parent_node, field_id, language).map(
                     |(leading_node, trailing_node)| Range {
@@ -372,12 +241,34 @@ impl<'a> Binding<'a, MarzanoQueryContext> for MarzanoBinding<'a> {
         }
     }
 
+    fn range(&self, language: &TargetLanguage) -> Option<ByteRange> {
+        match self {
+            Self::Empty(_, _) => None,
+            Self::Node(node) => Some(node.byte_range()),
+            Self::String(_, range) => Some(range.to_owned()),
+            Self::List(parent_node, field_id) => {
+                get_range_nodes_for_list(parent_node, field_id, language).map(
+                    |(leading_node, trailing_node)| {
+                        ByteRange::new(
+                            leading_node.node.start_byte() as usize,
+                            trailing_node.node.end_byte() as usize,
+                        )
+                    },
+                )
+            }
+            Self::FileName(_) => None,
+            Self::ConstantRef(_) => None,
+        }
+    }
+
     // todo implement for empty and empty list
     fn code_range(&self, language: &TargetLanguage) -> Option<CodeRange> {
         match self {
             Self::Empty(_, _) => None,
             Self::Node(node) => Some(node.code_range()),
-            Self::String(src, range) => Some(CodeRange::new(range.start_byte, range.end_byte, src)),
+            Self::String(src, range) => {
+                Some(CodeRange::new(range.start as u32, range.end as u32, src))
+            }
             Self::List(parent_node, field_id) => {
                 get_range_nodes_for_list(parent_node, field_id, language).map(
                     |(leading_node, trailing_node)| {
@@ -406,7 +297,7 @@ impl<'a> Binding<'a, MarzanoQueryContext> for MarzanoBinding<'a> {
                 Self::Node(node2) => are_equivalent(node1, node2),
                 Self::String(str, range) => self
                     .text(language)
-                    .is_ok_and(|t| t == str[range.start_byte as usize..range.end_byte as usize]),
+                    .is_ok_and(|t| t == str[range.start..range.end]),
                 Self::FileName(_) | Self::List(..) | Self::Empty(..) | Self::ConstantRef(_) => {
                     false
                 }
@@ -439,7 +330,7 @@ impl<'a> Binding<'a, MarzanoQueryContext> for MarzanoBinding<'a> {
             Self::ConstantRef(c1) => other.as_constant().map_or(false, |c2| *c1 == c2),
             Self::String(s1, range) => other
                 .text(language)
-                .is_ok_and(|t| t == s1[range.start_byte as usize..range.end_byte as usize]),
+                .is_ok_and(|t| t == s1[range.start..range.end]),
             Self::FileName(s1) => other.as_filename().map_or(false, |s2| *s1 == s2),
         }
     }
@@ -519,7 +410,7 @@ impl<'a> Binding<'a, MarzanoQueryContext> for MarzanoBinding<'a> {
                 effects,
                 files,
                 memo,
-                node.clone(),
+                node,
                 node.code_range(),
                 distributed_indent,
                 logs,
@@ -527,13 +418,12 @@ impl<'a> Binding<'a, MarzanoQueryContext> for MarzanoBinding<'a> {
             .map(|r| r.0),
             // can't linearize until we update source to point to the entire file
             // otherwise file file pointers won't match
-            Self::String(s, r) => Ok(Cow::Owned(
-                s[r.start_byte as usize..r.end_byte as usize].into(),
-            )),
+            Self::String(s, r) => Ok(Cow::Owned(s[r.start..r.end].into())),
             Self::FileName(s) => Ok(Cow::Owned(s.to_string_lossy().into())),
             Self::List(parent_node, _field_id) => {
-                if let Some(pos) = self.position(language) {
-                    let range = CodeRange::new(pos.start_byte, pos.end_byte, parent_node.source);
+                if let Some(range) = self.range(language) {
+                    let range =
+                        CodeRange::new(range.start as u32, range.end as u32, parent_node.source);
                     linearize_binding(
                         language,
                         effects,
@@ -541,7 +431,7 @@ impl<'a> Binding<'a, MarzanoQueryContext> for MarzanoBinding<'a> {
                         memo,
                         // ideally we should be passing list as an ast_node
                         // a little tricky atm
-                        parent_node.clone(),
+                        parent_node,
                         range,
                         distributed_indent,
                         logs,
@@ -560,10 +450,10 @@ impl<'a> Binding<'a, MarzanoQueryContext> for MarzanoBinding<'a> {
         match self {
             Self::Empty(_, _) => Ok("".into()),
             Self::Node(node) => Ok(node.text()?),
-            Self::String(s, r) => Ok(s[r.start_byte as usize..r.end_byte as usize].into()),
+            Self::String(s, r) => Ok(s[r.start..r.end].into()),
             Self::FileName(s) => Ok(s.to_string_lossy()),
-            Self::List(node, _) => Ok(if let Some(pos) = self.position(language) {
-                node.source[pos.start_byte as usize..pos.end_byte as usize].into()
+            Self::List(node, _) => Ok(if let Some(pos) = self.range(language) {
+                node.source[pos.start..pos.end].into()
             } else {
                 "".into()
             }),

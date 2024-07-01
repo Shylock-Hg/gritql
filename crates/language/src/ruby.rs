@@ -1,8 +1,8 @@
 use crate::language::{fields_for_nodes, Field, MarzanoLanguage, NodeTypes, SortId, TSLanguage};
 use grit_util::Language;
+use lazy_static::lazy_static;
 use marzano_util::node_with_source::NodeWithSource;
 use regex::Regex;
-use lazy_static::lazy_static;
 use std::sync::OnceLock;
 
 static NODE_TYPES_STRING: &str = include_str!("../../../resources/node-types/ruby-node-types.json");
@@ -56,14 +56,14 @@ impl NodeTypes for Ruby {
 lazy_static! {
     static ref EXACT_VARIABLE_REGEX: Regex = Regex::new(r"^\^([A-Za-z_][A-Za-z0-9_]*)$")
         .expect("Failed to compile EXACT_VARIABLE_REGEX");
-    static ref VARIABLE_REGEX: Regex = Regex::new(r"\^(\.\.\.|[A-Za-z_][A-Za-z0-9_]*)")
-        .expect("Failed to compile VARIABLE_REGEX");
-    static ref BRACKET_VAR_REGEX: Regex = Regex::new(r"\^\[([A-Za-z_][A-Za-z0-9_]*)\]")
-        .expect("Failed to compile BRACKET_VAR_REGEX");
+    static ref VARIABLE_REGEX: Regex =
+        Regex::new(r"\^(\.\.\.|[A-Za-z_][A-Za-z0-9_]*)").expect("Failed to compile VARIABLE_REGEX");
+    static ref BRACKET_VAR_REGEX: Regex =
+        Regex::new(r"\^\[([A-Za-z_][A-Za-z0-9_]*)\]").expect("Failed to compile BRACKET_VAR_REGEX");
 }
 
 impl Language for Ruby {
-    type Node<'a> = NodeWithSource<'a>;
+    use_marzano_delegate!();
 
     fn language_name(&self) -> &'static str {
         "Ruby"
@@ -80,14 +80,6 @@ impl Language for Ruby {
 
     fn comment_prefix(&self) -> &'static str {
         "#"
-    }
-
-    fn is_comment(&self, node: &NodeWithSource) -> bool {
-        MarzanoLanguage::is_comment_node(self, node)
-    }
-
-    fn is_metavariable(&self, node: &NodeWithSource) -> bool {
-        MarzanoLanguage::is_metavariable_node(self, node)
     }
 
     fn metavariable_prefix(&self) -> &'static str {

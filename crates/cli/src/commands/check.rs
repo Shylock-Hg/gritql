@@ -6,14 +6,14 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::info;
 use marzano_core::{
     api::{
-        is_match, AllDone, AllDoneReason, EnforcementLevel, MatchResult, RewriteReason,
-        RewriteSource,
+        is_match, AllDone, AllDoneReason, EnforcementLevel, MatchReason, MatchResult, RewriteSource,
     },
     fs::apply_rewrite,
     problem::Problem,
 };
 use marzano_gritmodule::{config::ResolvedGritDefinition, utils::extract_path};
 use marzano_language::target_language::{expand_paths, PatternLanguage};
+use marzano_messenger::emit::FlushableMessenger as _;
 use marzano_util::cache::GritCache;
 use marzano_util::rich_path::RichPath;
 use marzano_util::{finder::get_input_files, rich_path::RichFile};
@@ -36,7 +36,7 @@ use crate::{
     github::{log_check_annotations, write_check_summary},
     messenger_variant::create_emitter,
     resolver::{
-        get_grit_files_from, get_grit_files_from_cwd, resolve_from, resolve_from_cwd,
+        get_grit_files_from, get_grit_files_from_flags_or_cwd, resolve_from, resolve_from_cwd,
         GritModuleResolver, Source,
     },
     scan::log_check_json,
@@ -102,7 +102,10 @@ pub(crate) async fn run_check(
         grit_files.merge(global_files);
         (resolved, grit_files)
     } else {
-        try_join![resolve_from_cwd(&Source::All), get_grit_files_from_cwd()]?
+        try_join![
+            resolve_from_cwd(&Source::All),
+            get_grit_files_from_flags_or_cwd(format)
+        ]?
     };
 
     let enforced = resolved_patterns
@@ -119,10 +122,10 @@ pub(crate) async fn run_check(
         std::env::current_dir()?
     };
 
-    let filter_range = extract_filter_ranges(&arg.shared_filters)?;
+    let filter_range = extract_filter_ranges(&arg.shared_filters, Some(&current_dir))?;
 
     // Construct a resolver
-    let resolver = GritModuleResolver::new(current_dir.to_str().unwrap());
+    let resolver = GritModuleResolver::new();
 
     let mut body_to_pattern: HashMap<String, &ResolvedGritDefinition> = HashMap::new();
     let compile_tasks: Result<HashMap<String, Problem>, _> = enforced
@@ -194,7 +197,7 @@ pub(crate) async fn run_check(
                 !cache.has_no_matches(hash, pattern.hash)
             })
             .collect();
-        let (result, no_match) = pattern.execute_paths(&un_cached_input_files, &context);
+        let (result, no_match) = pattern.execute_paths(un_cached_input_files, &context);
         if !no_match.is_empty() {
             for path in no_match.into_iter() {
                 let hash = path.hash.unwrap();
@@ -259,6 +262,7 @@ pub(crate) async fn run_check(
 
         match emitter {
             crate::messenger_variant::MessengerVariant::Formatted(_)
+            | crate::messenger_variant::MessengerVariant::Transformed(_)
             | crate::messenger_variant::MessengerVariant::JsonLine(_) => {
                 info!("Local only, skipping check registration.");
             }
@@ -280,11 +284,12 @@ pub(crate) async fn run_check(
             for result in results {
                 let rewrite_with_reason = match &result.result {
                     MatchResult::Rewrite(r) => {
-                        let reason = Some(RewriteReason {
+                        let reason = Some(MatchReason {
                             metadata_json: None,
                             source: RewriteSource::Gritql,
                             name: Some(result.pattern.local_name.to_string()),
                             level: Some(result.pattern.level()),
+                            explanation: None,
                         });
                         let mut rewrite = r.clone();
                         rewrite.reason = reason;
@@ -373,7 +378,7 @@ pub(crate) async fn run_check(
                     .collect::<HashSet<_>>();
                 for pattern in applicable_patterns {
                     let problem = compiled_map.get(pattern).unwrap();
-                    let src = std::fs::read_to_string(file)?;
+                    let src = fs_err::read_to_string(file)?;
                     let res = problem.execute_file(&RichFile::new(file.to_string(), src), &context);
                     for r in res {
                         if let MatchResult::Rewrite(r) = r {

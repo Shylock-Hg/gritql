@@ -28,7 +28,7 @@ use crate::{
 };
 use anyhow::Result;
 use clap::ValueEnum;
-use grit_util::{Ast, AstNode, CodeRange, Language, Parser, SnippetTree};
+use grit_util::{Ast, AstNode, ByteRange, CodeRange, Language, Parser, SnippetTree};
 use marzano_util::node_with_source::NodeWithSource;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -165,6 +165,7 @@ impl PatternLanguage {
                 Some("inline") => Some(Self::MarkdownInline),
                 _ => Some(Self::MarkdownInline),
             },
+            "ipynb" => Some(Self::Python),
             "python" => Some(Self::Python),
             "go" => Some(Self::Go),
             "rust" => Some(Self::Rust),
@@ -197,7 +198,7 @@ impl PatternLanguage {
             PatternLanguage::Json => &["json"],
             PatternLanguage::Java => &["java"],
             PatternLanguage::CSharp => &["cs"],
-            PatternLanguage::Python => &["py"],
+            PatternLanguage::Python => &["py", "ipynb"],
             PatternLanguage::MarkdownBlock => &["md", "mdx", "mdoc"],
             PatternLanguage::MarkdownInline => &["md", "mdx", "mdoc"],
             PatternLanguage::Go => &["go"],
@@ -252,6 +253,7 @@ impl PatternLanguage {
             "json" => Some(Self::Json),
             "java" => Some(Self::Java),
             "cs" => Some(Self::CSharp),
+            "ipynb" => Some(Self::Python),
             "py" => Some(Self::Python),
             "md" | "mdx" | "mdoc" => Some(Self::MarkdownBlock),
             "go" => Some(Self::Go),
@@ -271,7 +273,7 @@ impl PatternLanguage {
         self.get_file_extensions().contains(&ext)
     }
 
-    // slightly inneficient but ensures the names are cosnsistent
+    // slightly inefficient but ensures the names are consistent
     pub fn language_name(self) -> &'static str {
         self.try_into()
             .map(|l: TargetLanguage| l.language_name())
@@ -400,12 +402,6 @@ macro_rules! generate_target_language {
                 }
             }
 
-            fn alternate_metavariable_kinds(&self) -> &[&'static str] {
-                match self {
-                    $(Self::$language(lang) => Language::alternate_metavariable_kinds(lang)),+
-                }
-            }
-
             fn metavariable_prefix(&self) -> &'static str {
                 match self {
                     $(Self::$language(lang) => Language::metavariable_prefix(lang)),+
@@ -472,7 +468,7 @@ macro_rules! generate_target_language {
                 }
             }
 
-            fn comment_text_range(&self, node: &Self::Node<'_>) -> Option<grit_util::Range> {
+            fn comment_text_range(&self, node: &Self::Node<'_>) -> Option<ByteRange> {
                 match self {
                     $(Self::$language(lang) => Language::comment_text_range(lang, node)),+
                 }
@@ -502,21 +498,43 @@ macro_rules! generate_target_language {
                 }
             }
 
+            fn align_padding<'a>(
+                &self,
+                node: &Self::Node<'a>,
+                range: &CodeRange,
+                skip_ranges: &[CodeRange],
+                new_padding: Option<usize>,
+                offset: usize,
+                substitutions: &mut [(grit_util::EffectRange, String)],
+            ) -> std::borrow::Cow<'a, str> {
+                match self {
+                    $(Self::$language(lang) => Language::align_padding(
+                        lang,
+                        node,
+                        range,
+                        skip_ranges,
+                        new_padding,
+                        offset,
+                        substitutions
+                    )),+
+                }
+            }
+
+            fn pad_snippet<'a>(&self, snippet: &'a str, padding: &str) -> std::borrow::Cow<'a, str> {
+                match self {
+                    $(Self::$language(lang) => Language::pad_snippet(lang, snippet, padding)),+
+                }
+            }
+
+            fn get_skip_padding_ranges(&self, node: &Self::Node<'_>) -> Vec<grit_util::CodeRange> {
+                match self {
+                    $(Self::$language(lang) => Language::get_skip_padding_ranges(lang, node)),+
+                }
+            }
+
             fn should_pad_snippet(&self) -> bool {
                 match self {
                     $(Self::$language(lang) => Language::should_pad_snippet(lang)),+
-                }
-            }
-
-            fn should_skip_padding(&self, node: &NodeWithSource<'_>) -> bool {
-                match self {
-                    $(Self::$language(lang) => Language::should_skip_padding(lang, node)),+
-                }
-            }
-
-            fn get_skip_padding_ranges_for_snippet(&self, snippet: &str) -> Vec<CodeRange> {
-                match self {
-                    $(Self::$language(lang) => Language::get_skip_padding_ranges_for_snippet(lang, snippet)),+
                 }
             }
 
