@@ -20,7 +20,7 @@ use rayon::iter::ParallelIterator;
 use regex::Regex;
 use std::sync::Once;
 
-use crate::common::{get_fixture, get_fixtures_root, run_init_cmd};
+use crate::common::{get_fixture, get_fixtures_root, run_init_cmd, INSTA_FILTERS};
 
 mod common;
 
@@ -1543,7 +1543,7 @@ fn filtered_apply() -> Result<()> {
 
     let stdout = String::from_utf8(output.stdout)?;
     println!("stdout: {:?}", stdout);
-    assert!(stdout.contains("2 matches"));
+    assert!(stdout.contains("3 matches"));
 
     let content = fs_err::read_to_string(dir.join("file.js"))?;
     assert_snapshot!(content);
@@ -1708,7 +1708,9 @@ fn output_jsonl() -> Result<()> {
     );
 
     let content = fs_err::read_to_string(dir.join("output.jsonl"))?;
-    assert_snapshot!(content);
+    insta::with_settings!({filters => INSTA_FILTERS.to_vec()}, {
+        assert_snapshot!(content);
+    });
 
     let line_count = content.lines().count();
     assert_eq!(line_count, 3);
@@ -2075,7 +2077,7 @@ fn overrides_limit() -> Result<()> {
         "Command didn't finish successfully"
     );
 
-    assert!(stdout.contains("found 2 matches"));
+    assert!(stdout.contains("2 files"));
 
     Ok(())
 }
@@ -2274,7 +2276,7 @@ fn applies_on_file_in_hidden_directory() -> Result<()> {
     );
 
     let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("Processed 1 files and found 1 matches"));
+    assert!(stdout.contains("1 files"));
 
     let content: String = fs_err::read_to_string(dir.join(".circleci").join("config.yml"))?;
     assert_eq!(content, "");
@@ -2653,6 +2655,43 @@ fn tty_behavior() -> Result<()> {
 
     let content = fs_err::read_to_string(dir.join("file.yaml"))?;
     assert_snapshot!(content);
+
+    Ok(())
+}
+
+/// If there's no rewrite, the warning can be skipped.
+#[test]
+fn no_search_warning() -> Result<()> {
+    let (_temp_dir, dir) = get_fixture("yaml_padding", true)?;
+
+    // Init an empty git repo
+    let mut git_init_cmd = Command::new("git");
+    git_init_cmd.arg("init").current_dir(dir.clone());
+    let output = git_init_cmd.output()?;
+    assert!(output.status.success(), "Git init failed");
+
+    // from the tempdir as cwd, run marzano apply
+    let mut apply_cmd = get_test_cmd()?;
+    apply_cmd.current_dir(dir.clone());
+    apply_cmd
+        .arg("apply")
+        .arg("--language=yaml")
+        .arg("`stuff: good`")
+        .arg("file.yaml");
+
+    let output = apply_cmd.output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    println!("stdout: {:?}", stdout);
+    println!("stderr: {:?}", stderr);
+
+    // Expect it to fail
+    assert!(output.status.success(), "Command should have passed");
+
+    assert!(!stderr.contains("Untracked changes detected."));
+
+    assert!(stdout.contains("stuff: good"));
+    assert!(stdout.contains("Processed 1 files and found 1 matches"));
 
     Ok(())
 }

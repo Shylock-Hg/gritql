@@ -49,7 +49,8 @@ impl<'b> RichPattern<'b> {
     ) -> Result<CompilationResult> {
         let lang = language.unwrap_or_default();
         #[cfg(not(feature = "ai_builtins"))]
-        let injected_builtins: Option<BuiltIns> = None;
+        let injected_builtins: Option<BuiltIns> =
+            marzano_core::built_in_functions::get_ai_placeholder_functions();
         #[cfg(feature = "ai_builtins")]
         let injected_builtins = Some(ai_builtins::ai_builtins::get_ai_built_in_functions());
 
@@ -132,7 +133,7 @@ macro_rules! emit_error {
                     range: None,
                     source: None,
                 });
-                $emitter.emit(&log, $min_level).unwrap();
+                $emitter.emit(&log).unwrap();
                 return $emitter;
             }
         }
@@ -188,7 +189,6 @@ where
     let cache_ref = &cache;
 
     let mut interactive = arg.interactive;
-    let min_level = &arg.visibility;
 
     let (found_count, disk_paths) = match my_input {
         ApplyInput::Disk(ref my_input) => {
@@ -239,7 +239,6 @@ where
                             vec![log, done_file],
                             details,
                             arg.dry_run,
-                            min_level,
                             arg.format,
                             &mut interactive,
                             None,
@@ -311,7 +310,6 @@ where
                     message,
                     details,
                     arg.dry_run,
-                    min_level,
                     arg.format,
                     &mut interactive,
                     pg,

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::to_string_pretty;
 use std::path::PathBuf;
 use std::{fmt, str::FromStr, vec};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
@@ -213,6 +214,10 @@ impl MatchResult {
         }
     }
 
+    pub fn get_ranges(&self) -> Option<&Vec<Range>> {
+        fs::extract_ranges(self)
+    }
+
     /// Given a MatchResult, create a MatchResult::Rewrite that suppresses the match.
     /// Returns None if it has any issues.
     pub fn get_rewrite_to_suppress<'a>(
@@ -297,6 +302,7 @@ pub struct PatternInfo {
     pub source_file: String,
     pub parsed_pattern: String,
     pub valid: bool,
+    pub uses_ai: bool,
 }
 
 impl PatternInfo {
@@ -309,12 +315,16 @@ impl PatternInfo {
             &grit_node_types,
         ))
         .unwrap();
+
+        let uses_ai = crate::analysis::uses_ai(&compiled.pattern, &compiled.definitions());
+
         Self {
             messages: vec![],
             variables: compiled.compiled_vars(),
             source_file,
             parsed_pattern,
             valid: true,
+            uses_ai,
         }
     }
 }
@@ -343,6 +353,8 @@ pub struct Match {
     pub ranges: Vec<Range>,
     #[serde(default)]
     pub reason: Option<MatchReason>,
+    #[serde(default)]
+    pub id: Uuid,
 }
 
 impl From<EntireFile> for Match {
@@ -354,6 +366,7 @@ impl From<EntireFile> for Match {
             ranges: file_match.ranges,
             reason: None,
             content: file_match.content,
+            id: Uuid::new_v4(),
         }
     }
 }
@@ -456,6 +469,8 @@ pub struct Rewrite {
     pub rewritten: EntireFile,
     #[serde(default)]
     pub reason: Option<MatchReason>,
+    #[serde(default)]
+    pub id: Uuid,
 }
 
 impl From<Rewrite> for MatchResult {
@@ -558,6 +573,7 @@ impl Rewrite {
             original,
             rewritten,
             reason,
+            id: Uuid::new_v4(),
         }
     }
 }
@@ -568,6 +584,8 @@ pub struct CreateFile {
     pub rewritten: EntireFile,
     range: Option<Vec<Range>>,
     pub reason: Option<MatchReason>,
+    #[serde(default)]
+    pub id: Uuid,
 }
 
 impl From<CreateFile> for MatchResult {
@@ -582,6 +600,7 @@ impl CreateFile {
             rewritten: EntireFile::file_to_entire_file(name, body, None),
             range: None,
             reason: None,
+            id: Uuid::new_v4(),
         }
     }
 }
@@ -622,6 +641,8 @@ pub struct RemoveFile {
     pub original: EntireFile,
     #[serde(default)]
     pub reason: Option<MatchReason>,
+    #[serde(default)]
+    pub id: Uuid,
 }
 
 impl From<RemoveFile> for MatchResult {
@@ -681,7 +702,9 @@ pub struct Message {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct AllDone {
+    /// How many files have been processed
     pub processed: i32,
+    /// How many matches were found
     pub found: i32,
     pub reason: AllDoneReason,
 }

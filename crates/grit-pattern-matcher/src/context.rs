@@ -67,3 +67,55 @@ pub trait ExecContext<'a, Q: QueryContext> {
 
     fn name(&self) -> Option<&str>;
 }
+
+/// Static information used for a pattern
+/// This is useful for static analysis of patterns without running the query engine.
+#[derive(Debug)]
+pub struct StaticDefinitions<'a, Q: QueryContext> {
+    pattern_definitions: &'a [PatternDefinition<Q>],
+    predicate_definitions: &'a [PredicateDefinition<Q>],
+    function_definitions: &'a [GritFunctionDefinition<Q>],
+    /// Pattern indexes we should skip during analysis (before_each_file / after_each_file)
+    pub skippable_indexes: Vec<usize>,
+}
+
+impl<'a, Q: QueryContext> StaticDefinitions<'a, Q> {
+    pub fn new(
+        pattern_definitions: &'a [PatternDefinition<Q>],
+        predicate_definitions: &'a [PredicateDefinition<Q>],
+        function_definitions: &'a [GritFunctionDefinition<Q>],
+    ) -> Self {
+        StaticDefinitions {
+            pattern_definitions,
+            predicate_definitions,
+            function_definitions,
+            skippable_indexes: vec![],
+        }
+    }
+
+    pub fn get_pattern(&self, index: usize) -> Option<&PatternDefinition<Q>> {
+        if self.skippable_indexes.contains(&index) {
+            return None;
+        }
+        self.pattern_definitions.get(index)
+    }
+
+    pub fn get_predicate(&self, index: usize) -> Option<&PredicateDefinition<Q>> {
+        self.predicate_definitions.get(index)
+    }
+
+    pub fn get_function(&self, index: usize) -> Option<&GritFunctionDefinition<Q>> {
+        self.function_definitions.get(index)
+    }
+}
+
+impl<'a, Q: QueryContext> Default for StaticDefinitions<'a, Q> {
+    fn default() -> Self {
+        Self {
+            pattern_definitions: &[],
+            predicate_definitions: &[],
+            function_definitions: &[],
+            skippable_indexes: vec![],
+        }
+    }
+}

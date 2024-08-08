@@ -12,12 +12,12 @@ use grit_pattern_matcher::{
         ResolvedSnippet, State,
     },
 };
-use grit_util::{AnalysisLogs, Language};
+use grit_util::{AnalysisLogs, CodeRange, Language};
 use im::Vector;
 use itertools::Itertools;
 use rand::prelude::SliceRandom;
 use rand::Rng;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 // todo we can probably use a macro to generate a function that takes a vec and
 // and calls the input function with the vec args unpacked.
@@ -85,6 +85,7 @@ impl BuiltIns {
         built_ins: &BuiltIns,
         index: usize,
         lang: &impl Language,
+        name: &str,
     ) -> Result<CallBuiltIn<MarzanoQueryContext>> {
         let params = &built_ins.0[index].params;
         let mut pattern_params = Vec::with_capacity(args.len());
@@ -94,7 +95,7 @@ impl BuiltIns {
                 None => pattern_params.push(None),
             }
         }
-        Ok(CallBuiltIn::new(index, pattern_params))
+        Ok(CallBuiltIn::new(index, name, pattern_params))
     }
 
     /// Add an anonymous built-in, used for callbacks
@@ -144,7 +145,7 @@ impl BuiltIns {
             BuiltInFunction::new("capitalize", vec!["string"], Box::new(capitalize_fn)),
             BuiltInFunction::new("lowercase", vec!["string"], Box::new(lowercase_fn)),
             BuiltInFunction::new("uppercase", vec!["string"], Box::new(uppercase_fn)),
-            BuiltInFunction::new("text", vec!["string"], Box::new(text_fn)),
+            BuiltInFunction::new("text", vec!["string", "linearize"], Box::new(text_fn)),
             BuiltInFunction::new("trim", vec!["string", "trim_chars"], Box::new(trim_fn)),
             BuiltInFunction::new("join", vec!["list", "separator"], Box::new(join_fn)),
             BuiltInFunction::new("distinct", vec!["list"], Box::new(distinct_fn)),
@@ -245,10 +246,27 @@ fn text_fn<'a>(
 ) -> Result<MarzanoResolvedPattern<'a>> {
     let args = MarzanoResolvedPattern::from_patterns(args, state, context, logs)?;
 
-    let s = match args.first() {
-        Some(Some(resolved_pattern)) => resolved_pattern.text(&state.files, context.language())?,
-        _ => return Err(anyhow!("text takes 1 argument")),
+    let Some(Some(resolved_pattern)) = args.first() else {
+        return Err(anyhow!("text takes 1 argument"));
     };
+    let should_linearize = match args.get(1) {
+        Some(Some(resolved_pattern)) => resolved_pattern.is_truthy(state, context.language())?,
+        _ => false,
+    };
+    if !should_linearize {
+        let text = resolved_pattern.text(&state.files, context.language())?;
+        return Ok(ResolvedPattern::from_string(text.to_string()));
+    }
+    let mut memo: HashMap<CodeRange, Option<String>> = HashMap::new();
+    let effects: Vec<_> = state.effects.clone().into_iter().collect();
+    let s = resolved_pattern.linearized_text(
+        context.language(),
+        &effects,
+        &state.files,
+        &mut memo,
+        false,
+        logs,
+    )?;
     Ok(ResolvedPattern::from_string(s.to_string()))
 }
 
@@ -475,4 +493,27 @@ fn length_fn<'a>(
         }
         None => Err(anyhow!("length argument must be a list or string")),
     }
+}
+
+pub fn get_ai_placeholder_functions() -> Option<BuiltIns> {
+    Some(
+        vec![
+            BuiltInFunction::new(
+                "llm_chat",
+                vec!["model", "messages", "pattern"],
+                Box::new(ai_fn_placeholder),
+            ),
+            BuiltInFunction::new("embedding", vec!["target"], Box::new(ai_fn_placeholder)),
+        ]
+        .into(),
+    )
+}
+
+fn ai_fn_placeholder<'a>(
+    _args: &'a [Option<Pattern<MarzanoQueryContext>>],
+    _context: &'a MarzanoContext<'a>,
+    _state: &mut State<'a, MarzanoQueryContext>,
+    _logs: &mut AnalysisLogs,
+) -> Result<MarzanoResolvedPattern<'a>> {
+    bail!("AI features are not supported in your GritQL distribution. Please upgrade to the Enterprise version to use AI features.")
 }

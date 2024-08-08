@@ -1804,6 +1804,7 @@ dependencies = [
  "linked-hash-map",
  "pest",
  "pest_derive",
+ "regex",
  "serde",
  "similar",
  "yaml-rust",
@@ -2149,6 +2150,7 @@ dependencies = [
  "fs-err",
  "futures-util",
  "git2",
+ "grit-pattern-matcher",
  "grit-util",
  "grit_cache",
  "grit_cloud_client",
@@ -2216,6 +2218,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tree-sitter-facade-sg",
  "trim-margin",
+ "uuid",
  "walkdir",
 ]
 

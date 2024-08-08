@@ -3,6 +3,7 @@ use crate::{
     problem::MarzanoQueryContext,
 };
 use anyhow::{anyhow, Result};
+
 use grit_pattern_matcher::{
     binding::Binding,
     pattern::{
@@ -29,7 +30,10 @@ impl ASTNode {
 impl AstNodePattern<MarzanoQueryContext> for ASTNode {
     const INCLUDES_TRIVIA: bool = false;
 
-    fn children(&self) -> Vec<PatternOrPredicate<MarzanoQueryContext>> {
+    fn children<'a>(
+        &'a self,
+        _definitions: &'a grit_pattern_matcher::context::StaticDefinitions<MarzanoQueryContext>,
+    ) -> Vec<PatternOrPredicate<'a, MarzanoQueryContext>> {
         self.args
             .iter()
             .map(|a| PatternOrPredicate::Pattern(&a.2))
